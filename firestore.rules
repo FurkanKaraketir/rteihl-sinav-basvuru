@@ -1,0 +1,203 @@
+rules_version = '2';
+
+// Security model
+// --------------
+// * Admins: a user is an admin only if a document exists at /admins/{uid}.
+//   Create those documents by hand in the Firebase console. Signing in is
+//   not enough.
+// * The public site never lists personal data. Applicants claim a seat in
+//   one transaction that is checked below. What an applicant can read back
+//   (entry document, result) lives under a hash of T.C. + phone, so a T.C.
+//   number alone reveals nothing. Results are readable only after the
+//   release time (checked against Google's server clock).
+// * Anything not matched here is denied.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- helpers ----------
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/admins/$(request.auth.uid));
+    }
+
+    function settings() {
+      return get(/databases/$(database)/documents/system/settings).data;
+    }
+
+    function text(v, minLen, maxLen) {
+      return v is string && v.size() >= minLen && v.size() <= maxLen;
+    }
+
+    function isTc(v) {
+      return v is string && v.matches('[1-9][0-9]{10}');
+    }
+
+    function isPhone(v) {
+      return v is string && v.matches('5[0-9]{9}');
+    }
+
+    // Optional timestamp bounds: a missing/null field means "no bound".
+    function notBefore(s, field) {
+      return s.get(field, null) == null || request.time >= s[field];
+    }
+
+    function notAfter(s, field) {
+      return s.get(field, null) == null || request.time <= s[field];
+    }
+
+    function applicationOpen() {
+      let s = settings();
+      return s.get('applicationEnabled', false) == true
+        && notBefore(s, 'applicationStartAt')
+        && notAfter(s, 'applicationDeadlineAt');
+    }
+
+    function resultsOpen() {
+      let s = settings();
+      return s.get('resultsEnabled', false) == true
+        && s.get('resultsReleaseAt', null) is timestamp
+        && request.time >= s.resultsReleaseAt;
+    }
+
+    // Shape of a public seat claim (same data on the hall's student doc and
+    // on the application doc).
+    function validSeat(d, tc, schoolId, hallId, orderNumber) {
+      let fields = ['tcId', 'studentFullName', 'studentSchoolName', 'parentFullName',
+                    'phoneNumber', 'schoolId', 'schoolName', 'hallId', 'hallName',
+                    'orderNumber', 'assignedAt'];
+      return d.keys().hasOnly(fields)
+        && d.keys().hasAll(fields)
+        && isTc(tc)
+        && d.tcId == tc
+        && text(d.studentFullName, 3, 100)
+        && text(d.parentFullName, 3, 100)
+        && text(d.studentSchoolName, 2, 200)
+        && isPhone(d.phoneNumber)
+        && d.schoolId == schoolId
+        && d.hallId == hallId
+        && d.orderNumber == orderNumber
+        && d.assignedAt == request.time;
+    }
+
+    // ---------- admins ----------
+    match /admins/{uid} {
+      // Lets the UI check "am I an admin?". Managed only from the console.
+      allow get: if signedIn() && request.auth.uid == uid;
+      allow list, write: if false;
+    }
+
+    // ---------- public configuration ----------
+    match /system/{docId} {
+      allow get: if true;
+      allow list, write: if isAdmin();
+    }
+
+    match /general/{docId} {
+      allow get: if true;
+      allow list, write: if isAdmin();
+    }
+
+    match /events/{eventId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    match /pastYears/{year} {
+      allow read, write: if isAdmin();
+    }
+
+    // ---------- event applications ----------
+    match /eventApplications/{appId} {
+      allow create: if request.resource.data.eventId is string
+        && request.resource.data.submittedAt == request.time
+        && request.resource.data.keys().size() <= 50
+        && exists(/databases/$(database)/documents/events/$(request.resource.data.eventId))
+        && get(/databases/$(database)/documents/events/$(request.resource.data.eventId)).data.get('enabled', true) == true;
+      allow read, update, delete: if isAdmin();
+    }
+
+    // ---------- entry documents ----------
+    // Mirror of examApplications keyed by sha256("rteihl-entry:v1:" + T.C. +
+    // ":" + phone) — same format as entryKey() in src/lib/security.ts.
+    match /entryDocs/{key} {
+      allow get: if true;            // only reachable if you know T.C. + phone
+      allow list, update, delete: if isAdmin();
+      allow create: if isAdmin() || (
+        applicationOpen()
+        && isTc(request.resource.data.tcId)
+        && isPhone(request.resource.data.phoneNumber)
+        && key == hashing.sha256('rteihl-entry:v1:' + request.resource.data.tcId + ':' + request.resource.data.phoneNumber).toHexString().lower()
+        && !exists(/databases/$(database)/documents/examApplications/$(request.resource.data.tcId))
+        && getAfter(/databases/$(database)/documents/examApplications/$(request.resource.data.tcId)).data == request.resource.data
+      );
+    }
+
+    // ---------- exam results ----------
+    match /results/{key} {
+      // No list: a result can only be fetched by its exact hashed ID.
+      allow get: if isAdmin() || resultsOpen();
+      allow list, write: if isAdmin();
+    }
+
+    // ---------- schools / halls / seats ----------
+    match /schools/{schoolId} {
+      allow read: if true;
+      allow write: if isAdmin();
+
+      match /examHalls/{hallId} {
+        allow read: if true;
+        allow create, delete: if isAdmin();
+        // Public: claim exactly one seat (+1), within capacity, and only
+        // together with creating that student's record in the same write.
+        allow update: if isAdmin() || (
+          applicationOpen()
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['studentCount', 'lastAssignedTc'])
+          && request.resource.data.studentCount == resource.data.get('studentCount', 0) + 1
+          && request.resource.data.studentCount <= resource.data.capacity
+          && isTc(request.resource.data.lastAssignedTc)
+          && !exists(/databases/$(database)/documents/schools/$(schoolId)/examHalls/$(hallId)/students/$(request.resource.data.lastAssignedTc))
+          && existsAfter(/databases/$(database)/documents/schools/$(schoolId)/examHalls/$(hallId)/students/$(request.resource.data.lastAssignedTc))
+        );
+
+        match /students/{tc} {
+          // Personal data: admins only, except the applicant's own seat claim.
+          allow read, update, delete: if isAdmin();
+          allow create: if isAdmin() || (
+            applicationOpen()
+            && getAfter(/databases/$(database)/documents/schools/$(schoolId)/examHalls/$(hallId)).data.lastAssignedTc == tc
+            && getAfter(/databases/$(database)/documents/schools/$(schoolId)/examHalls/$(hallId)).data.studentCount
+                 == get(/databases/$(database)/documents/schools/$(schoolId)/examHalls/$(hallId)).data.get('studentCount', 0) + 1
+            && validSeat(request.resource.data, tc, schoolId, hallId,
+                 getAfter(/databases/$(database)/documents/schools/$(schoolId)/examHalls/$(hallId)).data.studentCount)
+            && request.resource.data.hallName == get(/databases/$(database)/documents/schools/$(schoolId)/examHalls/$(hallId)).data.name
+            && request.resource.data.schoolName == get(/databases/$(database)/documents/schools/$(schoolId)).data.name
+            && !exists(/databases/$(database)/documents/examApplications/$(tc))
+            && getAfter(/databases/$(database)/documents/examApplications/$(tc)).data == request.resource.data
+          );
+        }
+      }
+    }
+
+    // ---------- exam applications ----------
+    match /examApplications/{tc} {
+      // The public may only read an application that does NOT exist (the
+      // form's duplicate check). Existing ones are admin-only; applicants see
+      // their data through /entryDocs, which needs T.C. + phone.
+      allow get: if isAdmin() || resource == null;
+      allow list, update, delete: if isAdmin();
+      // Public create only as part of a seat claim; the student rule above
+      // validates the content and this checks both copies are identical.
+      allow create: if isAdmin() || (
+        applicationOpen()
+        && request.resource.data.schoolId is string
+        && request.resource.data.hallId is string
+        && getAfter(/databases/$(database)/documents/schools/$(request.resource.data.schoolId)/examHalls/$(request.resource.data.hallId)/students/$(tc)).data == request.resource.data
+      );
+    }
+  }
+}
